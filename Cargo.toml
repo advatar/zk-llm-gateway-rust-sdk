@@ -1,0 +1,45 @@
+[package]
+name = "zk-llm-gateway-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust SDK for the ZK LLM Gateway: encrypted envelopes, token-class padding, and ZK-ready usage tickets."
+repository = "https://github.com/your-org/zk-llm-gateway-sdk"
+keywords = ["privacy", "zk", "llm", "gateway", "rust"]
+categories = ["api-bindings", "cryptography"]
+
+[features]
+# Default uses rustls for TLS and enables redaction helpers.
+default = ["reqwest-rustls", "redaction"]
+reqwest-rustls = ["reqwest/rustls-tls"]
+reqwest-native-tls = ["reqwest/native-tls"]
+
+# Enable the redaction helpers (regex-based). On by default because it helps reduce accidental leakage.
+redaction = ["regex"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+hkdf = "0.12"
+url = "2"
+
+# Crypto
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+
+# HTTP
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+
+# Async
+async-trait = "0.1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "sync"] }
+
+# Optional
+regex = { version = "1", optional = true }
+
+[dev-dependencies]
+anyhow = "1"
