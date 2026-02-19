@@ -18,6 +18,6 @@ pub mod ticket;
 pub mod redaction;
 
 pub use crate::client::{GatewayClient, GatewayClientConfig};
-pub use crate::crypto::{GatewayPublicKey, Envelope};
+pub use crate::crypto::{Envelope, GatewayPublicKey};
 pub use crate::error::{Error, Result};
 pub use crate::token_class::TokenClass;

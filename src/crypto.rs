@@ -39,9 +39,15 @@ impl GatewayPublicKey {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Envelope {
     /// protocol version
+    #[serde(alias = "version")]
     pub v: u8,
     pub token_class: TokenClass,
+
+    /// Gateway canonical field name is `eph_pubkey_b64`.
+    /// Accept legacy `kem_pub_b64` when deserializing.
+    #[serde(alias = "kem_pub_b64")]
     pub eph_pubkey_b64: String,
+
     pub nonce_b64: String,
     pub ciphertext_b64: String,
 }
@@ -50,25 +56,37 @@ pub struct Envelope {
 pub(crate) struct SealState {
     pub token_class: TokenClass,
     pub eph_pubkey: [u8; 32],
-    pub key: [u8; 32],
+    pub resp_key: [u8; 32],
 }
 
-fn aad(v: u8, token_class: TokenClass, eph_pubkey: &[u8; 32]) -> Vec<u8> {
-    // Keep AAD deterministic and minimal. This is not secret.
-    // Including eph_pubkey binds the ciphertext to the request keypair.
-    let mut out = Vec::with_capacity(1 + 1 + 5 + 32);
-    out.push(v);
-    out.extend_from_slice(token_class.as_str().as_bytes());
-    out.push(b'|');
-    out.extend_from_slice(eph_pubkey);
-    out
+#[derive(Debug, Copy, Clone)]
+enum KeyDirection {
+    Request,
+    Response,
 }
 
-fn derive_key(shared_secret: &[u8; 32], v: u8, token_class: TokenClass) -> [u8; 32] {
+fn aad(v: u8, token_class: TokenClass, dir: KeyDirection) -> Vec<u8> {
+    let d = match dir {
+        KeyDirection::Request => 1u8,
+        KeyDirection::Response => 2u8,
+    };
+    vec![v, token_class.id_u8(), d]
+}
+
+fn hkdf_info(token_class: TokenClass, dir: KeyDirection) -> Vec<u8> {
+    let mut v = b"zk-llm-gateway-envelope-v1".to_vec();
+    match dir {
+        KeyDirection::Request => v.extend_from_slice(b"/req"),
+        KeyDirection::Response => v.extend_from_slice(b"/resp"),
+    }
+    v.push(token_class.id_u8());
+    v
+}
+
+fn derive_key(shared_secret: &[u8; 32], token_class: TokenClass, dir: KeyDirection) -> [u8; 32] {
     let hk = Hkdf::<Sha256>::new(None, shared_secret);
     let mut okm = [0u8; 32];
-    let info = format!("zk-llm-gateway|v{}|{}", v, token_class.as_str());
-    hk.expand(info.as_bytes(), &mut okm)
+    hk.expand(&hkdf_info(token_class, dir), &mut okm)
         .expect("hkdf expand");
     okm
 }
@@ -81,26 +99,24 @@ pub(crate) fn seal_json(
 ) -> Result<(Envelope, SealState)> {
     let v = 1u8;
 
-    // Serialize and pad
     let raw = serde_json::to_vec(json)?;
     let padded = pad_payload(&raw, token_class.request_padded_len())?;
 
-    // Ephemeral X25519
     let eph_secret = StaticSecret::random_from_rng(OsRng);
     let eph_public = PublicKey::from(&eph_secret);
     let eph_pub_bytes = eph_public.to_bytes();
 
-    // Shared secret and AEAD key
     let shared = eph_secret.diffie_hellman(&gateway_pk.as_public_key());
     let shared_bytes = shared.to_bytes();
-    let key = derive_key(&shared_bytes, v, token_class);
-    let cipher = ChaCha20Poly1305::new(&key.into());
+    let req_key = derive_key(&shared_bytes, token_class, KeyDirection::Request);
+    let resp_key = derive_key(&shared_bytes, token_class, KeyDirection::Response);
 
-    // Nonce
+    let cipher = ChaCha20Poly1305::new(&req_key.into());
+
     let mut nonce = [0u8; 12];
     OsRng.fill_bytes(&mut nonce);
 
-    let a = aad(v, token_class, &eph_pub_bytes);
+    let a = aad(v, token_class, KeyDirection::Request);
     let nonce_ga = nonce.into();
     let ct = cipher
         .encrypt(
@@ -123,7 +139,7 @@ pub(crate) fn seal_json(
     let st = SealState {
         token_class,
         eph_pubkey: eph_pub_bytes,
-        key,
+        resp_key,
     };
 
     Ok((env, st))
@@ -147,7 +163,7 @@ pub(crate) fn open_json(env: &Envelope, st: &SealState) -> Result<serde_json::Va
     let mut eph_pub_bytes = [0u8; 32];
     eph_pub_bytes.copy_from_slice(&eph_pub);
 
-    // Expect gateway to echo the eph_pubkey from request.
+    // Expect gateway to echo the ephemeral request public key.
     if eph_pub_bytes != st.eph_pubkey {
         return Err(Error::Crypto);
     }
@@ -165,17 +181,11 @@ pub(crate) fn open_json(env: &Envelope, st: &SealState) -> Result<serde_json::Va
         .decode(env.ciphertext_b64.trim())
         .map_err(|e| Error::Base64(e.to_string()))?;
 
-    let cipher = ChaCha20Poly1305::new(&st.key.into());
-    let a = aad(env.v, env.token_class, &eph_pub_bytes);
+    let cipher = ChaCha20Poly1305::new(&st.resp_key.into());
+    let a = aad(env.v, env.token_class, KeyDirection::Response);
     let nonce_ga = nonce.into();
     let padded = cipher
-        .decrypt(
-            &nonce_ga,
-            Payload {
-                msg: &ct,
-                aad: &a,
-            },
-        )
+        .decrypt(&nonce_ga, Payload { msg: &ct, aad: &a })
         .map_err(|_| Error::Crypto)?;
 
     let raw = unpad_payload(&padded)?;
@@ -187,13 +197,12 @@ pub(crate) fn open_json(env: &Envelope, st: &SealState) -> Result<serde_json::Va
 mod tests {
     use super::*;
     use crate::padding::pad_payload;
-    use base64::{engine::general_purpose, Engine as _};
+    use base64::engine::general_purpose;
     use chacha20poly1305::{aead::Aead, aead::Payload, ChaCha20Poly1305, KeyInit};
     use rand::RngCore;
 
     #[test]
     fn encrypt_decrypt_roundtrip() {
-        // Generate a random gateway keypair for the test.
         let gw_secret = StaticSecret::random_from_rng(OsRng);
         let gw_public = PublicKey::from(&gw_secret);
         let gateway_pk = GatewayPublicKey(gw_public.to_bytes());
@@ -202,7 +211,7 @@ mod tests {
         let req_json = serde_json::json!({"hello": "world"});
         let (env_req, st) = seal_json(&gateway_pk, token_class, &req_json).unwrap();
 
-        // Simulate gateway decrypting request: derive shared secret using gateway secret and eph pubkey.
+        // Gateway side: derive shared secret using request eph pubkey.
         let eph_pub_bytes = general_purpose::STANDARD
             .decode(env_req.eph_pubkey_b64)
             .unwrap();
@@ -210,17 +219,21 @@ mod tests {
         eph_pub_arr.copy_from_slice(&eph_pub_bytes);
         let eph_pub = PublicKey::from(eph_pub_arr);
         let shared = gw_secret.diffie_hellman(&eph_pub);
-        let key = derive_key(&shared.to_bytes(), env_req.v, env_req.token_class);
-        assert_eq!(key, st.key);
+        let shared_bytes = shared.to_bytes();
 
-        // Create a response encrypted with the same derived key and eph_pubkey.
+        let resp_key = derive_key(&shared_bytes, token_class, KeyDirection::Response);
+
+        assert_eq!(resp_key, st.resp_key);
+
+        // Response is encrypted with response-direction key/AAD.
         let resp_json = serde_json::json!({"upstream": {"ok": true}});
         let raw = serde_json::to_vec(&resp_json).unwrap();
         let padded = pad_payload(&raw, token_class.response_padded_len()).unwrap();
-        let cipher = ChaCha20Poly1305::new(&key.into());
+        let cipher = ChaCha20Poly1305::new(&resp_key.into());
+
         let mut nonce = [0u8; 12];
         OsRng.fill_bytes(&mut nonce);
-        let a = aad(env_req.v, token_class, &st.eph_pubkey);
+        let a = aad(env_req.v, token_class, KeyDirection::Response);
         let nonce_ga = nonce.into();
         let ct = cipher
             .encrypt(
@@ -231,6 +244,7 @@ mod tests {
                 },
             )
             .unwrap();
+
         let env_resp = Envelope {
             v: env_req.v,
             token_class,

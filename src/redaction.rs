@@ -73,7 +73,10 @@ impl Redactor {
         let phone = Regex::new(r"\b\+?[0-9][0-9() \-]{7,}[0-9]\b").unwrap();
         let eth = Regex::new(r"\b0x[a-fA-F0-9]{40}\b").unwrap();
         let apikey = Regex::new(r"\b(sk-[A-Za-z0-9]{16,})\b").unwrap();
-        let privkey = Regex::new(r"-----BEGIN[\s\S]*?PRIVATE KEY-----[\s\S]*?-----END[\s\S]*?PRIVATE KEY-----").unwrap();
+        let privkey = Regex::new(
+            r"-----BEGIN[\s\S]*?PRIVATE KEY-----[\s\S]*?-----END[\s\S]*?PRIVATE KEY-----",
+        )
+        .unwrap();
 
         Self {
             mode,
@@ -128,7 +131,10 @@ impl Redactor {
     }
 
     /// Redact all string leaf nodes in a JSON value.
-    pub fn redact_json(&self, value: &serde_json::Value) -> Result<(serde_json::Value, HashMap<String, String>)> {
+    pub fn redact_json(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<(serde_json::Value, HashMap<String, String>)> {
         let mut map: HashMap<String, String> = HashMap::new();
         let v = self.redact_json_inner(value, &mut map)?;
         Ok((v, map))

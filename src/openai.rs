@@ -1,7 +1,8 @@
 //! Lightweight OpenAI-style types.
 //!
 //! This module intentionally covers only a small subset of the schema.
-//! You can always fall back to `GatewayClient::infer_json` for arbitrary payloads.
+//! `GatewayClient::infer_json` and `GatewayClient::chat_completions` both
+//! target the gateway's canonical `InferenceRequest` protocol.
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
