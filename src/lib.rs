@@ -8,6 +8,7 @@
 mod client;
 mod crypto;
 mod error;
+pub mod integration;
 mod padding;
 mod token_class;
 
@@ -20,4 +21,8 @@ pub mod redaction;
 pub use crate::client::{GatewayClient, GatewayClientConfig};
 pub use crate::crypto::{Envelope, GatewayPublicKey};
 pub use crate::error::{Error, Result};
+pub use crate::integration::{
+    AppChatRequest, AppGateway, AppGatewayConfig, TicketSourceConfig, GATEWAY_INFER_PATH,
+    RELAY_INFER_PATH,
+};
 pub use crate::token_class::TokenClass;

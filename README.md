@@ -69,6 +69,42 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+### Drop-in app module
+
+If your Rust app just needs a small integration layer instead of wiring `GatewayClient`
+manually, use `integration::AppGatewayConfig` and `integration::AppGateway`.
+
+Environment variables:
+
+- `GATEWAY_BASE_URL` or `GATEWAY_URL` - base URL for the gateway or relay host
+- `GATEWAY_PUBLIC_KEY_B64` - base64 X25519 gateway public key
+- `GATEWAY_TICKETS_JSON` or `TICKETS_JSON` - JSON file containing pre-issued tickets
+- `GATEWAY_USE_DUMMY_TICKETS=true` - development-only fallback
+- `GATEWAY_INFER_PATH=/relay` or `GATEWAY_USE_RELAY=true` - send ciphertext through the relay
+- `GATEWAY_MODEL` or `MODEL` - default model name, defaults to `gpt-4o-mini`
+- `GATEWAY_TOKEN_CLASS` or `TOKEN_CLASS` - defaults to `c2048`
+- `GATEWAY_TEMPERATURE` - optional default temperature
+- `GATEWAY_TIMEOUT_SECS` - optional request timeout, defaults to `60`
+- `GATEWAY_AUTH_BEARER` - optional bearer token
+
+```rust
+use zk_llm_gateway_sdk::integration::AppGatewayConfig;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let gateway = AppGatewayConfig::from_env()?.build().await?;
+
+    let answer = gateway
+        .ask_with_system("You are a helpful assistant.", "Summarize our privacy model.")
+        .await?;
+
+    println!("{answer}");
+    Ok(())
+}
+```
+
+For a complete executable example, see `examples/app_gateway.rs`.
+
 ---
 
 ## Concepts
@@ -116,6 +152,7 @@ This is **not** a silver bullet, but it helps reduce accidental leakage.
 - `src/token_class.rs` — token classes + fixed padded sizes
 - `src/padding.rs` — padding/unpadding utilities
 - `src/client.rs` — `GatewayClient`
+- `src/integration.rs` — higher-level app wrapper and env-driven config
 - `src/ticket.rs` — ticket types + ticket sources
 - `src/openai.rs` — lightweight OpenAI-style request/response structs
 - `src/redaction.rs` — optional redaction utilities

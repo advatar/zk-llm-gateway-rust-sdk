@@ -59,8 +59,14 @@ struct InferenceRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
 
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+
     token_class: TokenClass,
     ticket: ZkTicket,
+
+    #[serde(default, flatten)]
+    extra: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +75,8 @@ struct InferenceResponse {
     model: String,
     output: String,
     billed_token_class: TokenClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,6 +113,94 @@ fn parse_chat_request(upstream: Value) -> Result<ChatCompletionsRequest> {
         "unsupported infer_json payload; expected ChatCompletions request or {path, body} wrapper"
             .to_string(),
     ))
+}
+
+fn build_inference_request(
+    token_class: TokenClass,
+    ticket: ZkTicket,
+    req: ChatCompletionsRequest,
+) -> Result<InferenceRequest> {
+    if req.stream == Some(true) {
+        return Err(Error::Protocol(
+            "stream=true is not supported on /v1/infer".to_string(),
+        ));
+    }
+
+    let ChatCompletionsRequest {
+        model,
+        messages,
+        temperature,
+        max_tokens,
+        stream,
+        extra,
+    } = req;
+
+    let extra = extra
+        .into_iter()
+        .filter(|(key, _)| !matches!(key.as_str(), "request_id" | "token_class" | "ticket"))
+        .collect();
+
+    Ok(InferenceRequest {
+        request_id: Uuid::new_v4(),
+        model,
+        messages,
+        max_tokens,
+        temperature,
+        stream,
+        token_class,
+        ticket,
+        extra,
+    })
+}
+
+fn parse_chat_completions_response(
+    default_model: &str,
+    resp_json: Value,
+) -> Result<ChatCompletionsResponse> {
+    // Preferred: canonical response object.
+    if let Ok(ir) = serde_json::from_value::<InferenceResponse>(resp_json.clone()) {
+        let billed_token_class = serde_json::to_value(ir.billed_token_class).unwrap_or(Value::Null);
+
+        if let Some(upstream) = ir.upstream.clone() {
+            let body = upstream.get("body").cloned().unwrap_or(upstream);
+            if let Ok(mut response) = serde_json::from_value::<ChatCompletionsResponse>(body) {
+                response
+                    .extra
+                    .insert("billed_token_class".to_string(), billed_token_class.clone());
+                if response.id.is_none() {
+                    response.id = Some(ir.request_id.to_string());
+                }
+                if response.model.is_none() {
+                    response.model = Some(ir.model.clone());
+                }
+                return Ok(response);
+            }
+        }
+
+        let mut extra = HashMap::new();
+        extra.insert("billed_token_class".to_string(), billed_token_class);
+
+        return Ok(ChatCompletionsResponse {
+            id: Some(ir.request_id.to_string()),
+            model: Some(ir.model.clone()),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: Some(ChatMessage::assistant(ir.output)),
+                finish_reason: Some("stop".to_string()),
+                extra: HashMap::new(),
+            }],
+            usage: None,
+            extra,
+        });
+    }
+
+    // Backward-compatible parsing for SDK-proxy gateways.
+    let body = resp_json.get("body").cloned().unwrap_or(resp_json);
+    let mut response = serde_json::from_value::<ChatCompletionsResponse>(body)?;
+    if response.model.is_none() {
+        response.model = Some(default_model.to_string());
+    }
+    Ok(response)
 }
 
 #[derive(Clone)]
@@ -194,16 +290,7 @@ impl GatewayClient {
         }
 
         let chat_req = parse_chat_request(upstream)?;
-
-        let payload = InferenceRequest {
-            request_id: Uuid::new_v4(),
-            model: chat_req.model,
-            messages: chat_req.messages,
-            max_tokens: chat_req.max_tokens,
-            temperature: chat_req.temperature,
-            token_class,
-            ticket,
-        };
+        let payload = build_inference_request(token_class, ticket, chat_req)?;
 
         let payload_json = serde_json::to_value(payload)?;
         let (env, st) = seal_json(&self.gateway_pk, token_class, &payload_json)?;
@@ -277,34 +364,118 @@ impl GatewayClient {
             req.max_tokens = Some(token_class.max_output_tokens_hint());
         }
 
+        let default_model = req.model.clone();
         let resp_json = self
             .infer_json(token_class, serde_json::to_value(req)?)
             .await?;
+        parse_chat_completions_response(&default_model, resp_json)
+    }
+}
 
-        // Preferred: canonical response object.
-        if let Ok(ir) = serde_json::from_value::<InferenceResponse>(resp_json.clone()) {
-            let mut extra = HashMap::new();
-            extra.insert(
-                "billed_token_class".to_string(),
-                serde_json::to_value(ir.billed_token_class).unwrap_or(Value::Null),
-            );
+#[cfg(test)]
+mod tests {
+    use super::{build_inference_request, parse_chat_completions_response};
+    use crate::openai::{ChatCompletionsRequest, ChatMessage};
+    use crate::ticket::ZkTicket;
+    use crate::token_class::TokenClass;
+    use serde_json::json;
+    use std::collections::HashMap;
+    use uuid::Uuid;
 
-            return Ok(ChatCompletionsResponse {
-                id: Some(ir.request_id.to_string()),
-                model: Some(ir.model.clone()),
-                choices: vec![ChatChoice {
-                    index: 0,
-                    message: Some(ChatMessage::assistant(ir.output)),
-                    finish_reason: Some("stop".to_string()),
-                    extra: HashMap::new(),
-                }],
-                usage: None,
-                extra,
-            });
-        }
+    #[test]
+    fn build_inference_request_preserves_passthrough_fields() {
+        let mut extra = HashMap::new();
+        extra.insert("top_p".to_string(), json!(0.9));
+        extra.insert(
+            "tools".to_string(),
+            json!([{ "type": "function", "function": { "name": "lookup" } }]),
+        );
 
-        // Backward-compatible parsing for SDK-proxy gateways.
-        let body = resp_json.get("body").cloned().unwrap_or(resp_json);
-        Ok(serde_json::from_value::<ChatCompletionsResponse>(body)?)
+        let req = ChatCompletionsRequest {
+            model: "gpt-4o-mini".to_string(),
+            messages: vec![ChatMessage::user("hello")],
+            temperature: Some(0.2),
+            max_tokens: Some(128),
+            stream: Some(false),
+            extra,
+        };
+
+        let ticket = ZkTicket::random_dummy(TokenClass::C1024);
+        let payload =
+            build_inference_request(TokenClass::C1024, ticket.clone(), req).expect("payload");
+        let payload_json = serde_json::to_value(payload).expect("serialize payload");
+
+        assert_eq!(payload_json["stream"], json!(false));
+        assert_eq!(payload_json["top_p"], json!(0.9));
+        assert_eq!(payload_json["tools"][0]["function"]["name"], json!("lookup"));
+        assert_eq!(payload_json["token_class"], json!("c1024"));
+        assert_eq!(payload_json["ticket"]["nullifier"], json!(ticket.nullifier));
+    }
+
+    #[test]
+    fn build_inference_request_rejects_stream_true() {
+        let req = ChatCompletionsRequest {
+            model: "gpt-4o-mini".to_string(),
+            messages: vec![ChatMessage::user("hello")],
+            temperature: None,
+            max_tokens: None,
+            stream: Some(true),
+            extra: HashMap::new(),
+        };
+
+        let err = build_inference_request(
+            TokenClass::C512,
+            ZkTicket::random_dummy(TokenClass::C512),
+            req,
+        )
+        .expect_err("stream=true should fail");
+
+        assert!(err.to_string().contains("stream=true is not supported"));
+    }
+
+    #[test]
+    fn canonical_response_prefers_raw_upstream_body() {
+        let request_id = Uuid::new_v4();
+        let resp_json = json!({
+            "request_id": request_id,
+            "model": "gpt-4o-mini",
+            "output": "",
+            "billed_token_class": "c2048",
+            "upstream": {
+                "id": "chatcmpl-123",
+                "model": "gpt-4o-mini",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {
+                                "name": "lookup_weather",
+                                "arguments": "{\"city\":\"Stockholm\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }]
+            }
+        });
+
+        let response =
+            parse_chat_completions_response("fallback-model", resp_json).expect("parse response");
+
+        assert_eq!(response.id.as_deref(), Some("chatcmpl-123"));
+        assert_eq!(
+            response.extra.get("billed_token_class"),
+            Some(&json!("c2048"))
+        );
+        let message = response.choices[0].message.as_ref().expect("assistant message");
+        assert_eq!(message.content, "");
+        assert_eq!(
+            message.extra["tool_calls"][0]["function"]["name"],
+            json!("lookup_weather")
+        );
     }
 }
